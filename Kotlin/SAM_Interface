@@ -1,0 +1,223 @@
+# Kotlin SAM 인터페이스
+
+SAM은 **Single Abstract Method**의 약자로 **추상 메서드가 하나인 인터페이스**를 의미합니다.
+
+Kotlin에서는 이를 **Functional Interface**라고 하며 `fun interface`로 선언합니다.
+
+```kotlin
+fun interface GetVersionUseCase {
+    suspend operator fun invoke(): Version
+}
+```
+
+Functional Interface는 추상 메서드는 하나만 가질 수 있으며, 구현이 존재하는 일반 메서드는 추가할 수 있습니다.
+
+```kotlin
+fun interface Printer {
+    fun print(message: String)
+
+    fun printError(message: String) {
+        print("ERROR: $message")
+    }
+}
+```
+
+---
+
+## SAM Conversion
+
+`fun interface`의 추상 메서드와 동일한 형태의 람다를 인터페이스의 구현 객체로 변환할 수 있습니다.
+
+이를 **SAM Conversion**이라고 합니다.
+
+```kotlin
+fun interface IntPredicate {
+    fun accept(i: Int): Boolean
+}
+```
+
+일반적인 익명 객체 구현:
+
+```kotlin
+val isEven = object : IntPredicate {
+    override fun accept(i: Int): Boolean {
+        return i % 2 == 0
+    }
+}
+```
+
+SAM Conversion을 사용하면 다음과 같이 작성할 수 있습니다.
+
+```kotlin
+val isEven = IntPredicate { it % 2 == 0 }
+```
+
+즉, 별도의 구현 클래스나 익명 객체 없이 람다로 구현할 수 있습니다.
+
+---
+
+## 장점
+
+### 1. 람다로 간결하게 구현할 수 있다
+
+`fun interface`는 SAM Conversion을 지원하므로 익명 객체 대신 람다를 사용할 수 있습니다.
+
+```kotlin
+fun interface OnClickListener {
+    fun onClick()
+}
+
+val listener = OnClickListener {
+    println("clicked")
+}
+```
+
+다음과 같은 익명 객체 구현보다 간결합니다.
+
+```kotlin
+val listener = object : OnClickListener {
+    override fun onClick() {
+        println("clicked")
+    }
+}
+```
+
+### 2. 독립적인 타입을 만들 수 있다
+
+`fun interface`는 새로운 인터페이스 타입을 정의합니다.
+
+```kotlin
+fun interface GetVersionUseCase {
+    suspend operator fun invoke(): Version
+}
+```
+
+여기서 `GetVersionUseCase`는 독립적인 타입입니다.
+
+반면 `typealias`는 기존 함수 타입에 이름만 붙입니다.
+
+```kotlin
+typealias GetVersionUseCase = suspend () -> Version
+```
+
+새로운 타입이 생성되는 것은 아니며 실제 타입은 여전히 다음 함수 타입입니다.
+
+```kotlin
+suspend () -> Version
+```
+
+정리하면:
+
+```text
+typealias
+→ 기존 타입에 다른 이름을 부여
+
+fun interface
+→ 새로운 인터페이스 타입을 정의
+```
+
+### 3. 비추상 메서드를 추가할 수 있다
+
+추상 메서드는 하나만 가능하지만 구현된 메서드는 추가할 수 있습니다.
+
+```kotlin
+fun interface Printer {
+    fun print(message: String)
+
+    fun printError(message: String) {
+        print("ERROR: $message")
+    }
+}
+```
+
+### 4. 다른 인터페이스를 확장할 수 있다
+
+Functional Interface도 일반 인터페이스처럼 다른 인터페이스를 상속할 수 있습니다.
+
+```kotlin
+interface Action
+
+fun interface ClickAction : Action {
+    fun onClick()
+}
+```
+
+따라서 단순 함수 타입보다 인터페이스가 제공하는 타입 시스템 기능을 사용할 수 있습니다.
+
+---
+
+## 단점
+
+### 1. 추상 메서드는 하나만 가질 수 있다
+
+Functional Interface는 이름 그대로 하나의 추상 메서드만 가져야 합니다.
+
+다음과 같이 추상 메서드가 두 개이면 사용할 수 없습니다.
+
+```kotlin
+fun interface UserAction {
+    fun create()
+    fun delete()
+}
+```
+
+### 2. 추상 프로퍼티를 가질 수 없다
+
+Functional Interface에는 추상 프로퍼티를 선언할 수 없습니다.
+
+```kotlin
+fun interface UserAction {
+    val name: String // 불가능
+
+    fun execute()
+}
+```
+
+### 3. 함수 타입보다 구조가 복잡하다
+
+단순히 함수를 전달하는 것이 목적이라면 Kotlin에서는 함수 타입을 직접 사용할 수 있습니다.
+
+```kotlin
+suspend () -> Version
+```
+
+또는 별칭을 붙일 수 있습니다.
+
+```kotlin
+typealias GetVersion = suspend () -> Version
+```
+
+`fun interface`는 별도의 인터페이스 타입을 정의하므로 함수 타입보다 추가적인 타입 구조를 갖습니다.
+
+---
+
+## `interface`, `fun interface`, 함수 타입 비교
+
+| 구분 | `interface` | `fun interface` | 함수 타입 |
+|---|---|---|---|
+| 추상 메서드 | 여러 개 가능 | 1개 | 함수 하나 |
+| 람다로 구현 | X | O | O |
+| 독립적인 타입 | O | O | X |
+| 구현된 메서드 추가 | O | O | X |
+| 인터페이스 상속 | O | O | X |
+| SAM Conversion | X | O | 해당 없음 |
+
+현재 코드:
+
+```kotlin
+interface GetVersionUseCase {
+    suspend operator fun invoke(): Version
+}
+```
+
+는 추상 메서드가 하나이므로 Functional Interface의 조건에 해당합니다.
+
+Functional Interface로 명시하면:
+
+```kotlin
+fun interface GetVersionUseCase {
+    suspend operator fun invoke(): Version
+}
+```
+
+가 되며, 이 경우 `GetVersionUseCase`라는 독립적인 타입을 유지하면서 **SAM Conversion을 통한 람다 구현이 가능해집니다.**
