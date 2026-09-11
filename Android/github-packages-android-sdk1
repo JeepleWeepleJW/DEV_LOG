@@ -1,0 +1,634 @@
+# GitHub Packages로 사내 배포하고 다른 프로젝트에서 가져다 쓰기1
+
+여러 앱에서 공통으로 쓰는 기능(버전 체크, 인증, 공통 네트워크 등)을 매번 복사·붙여넣기 하면서 사용하다가  
+공통된 기능들을 SDK로 만들어서 사내 라이브러리로 관리해보기로 결심했다.
+
+- 배포하는 쪽: `sample-android-sdk` (라이브러리 프로젝트)
+- 가져다 쓰는 쪽: `SampleApp` (앱 프로젝트)
+- 환경: AGP 9.x, Gradle Kotlin DSL, Version Catalog, Hilt + KSP
+
+---
+
+## 1. 왜 GitHub Packages인가
+
+배포를 하려면 선택지가 몇 가지 있다.
+
+| 방식 | 장점 | 단점 |
+|---|---|---|
+| Maven Central | 설정하면 누구나 사용 가능 | **공개됨**. 사내 전용 불가 |
+| JitPack (private) | 설정이 간단함 | 유료 플랜 필요 |
+| 사내 Nexus / Artifactory | 완전한 통제권 | 서버 구축·운영 비용 |
+| **GitHub Packages** | 이미 쓰는 GitHub 계정·권한 체계를 그대로 활용 | GitHub에 종속 |
+
+이미 GitHub로 프로젝트를 관리하고 있기 때문에  
+GitHub Packages로 배포하기로 결정했다.
+
+> **GitHub Packages는 "저장소(레지스트리)"다.**  
+> 따라서 별도의 `publish` 태스크를 실제로 실행해야한다.  
+> 패키지의 공개 범위는 소속 저장소의 visibility를 그대로 상속한다.  
+> 따라서 repository가 Private로 설정되어 있으면 "사내 전용" 으로 사용 가능하다.
+
+---
+
+## 2. 전체 구조
+
+```
+[배포 측] sample-android-sdk              [소비 측] SampleApp
+  :version (android-library)                :app (android-application)
+        │                                          ▲
+        │ ./gradlew :version:publish               │ implementation("com.sample.android:version:0.0.1")
+        ▼                                          │
+   GitHub Packages (Maven 레지스트리) ────────────────┘
+   github.com/my-org/sample-android-sdk  ← private
+```
+
+### 배포 측 디렉터리 구조
+
+```
+sample-android-sdk/
+├── settings.gradle.kts          # 모듈 등록, 저장소 정의
+├── build.gradle.kts             # 루트: 플러그인 선언만 (apply false)
+├── gradle/libs.versions.toml    # 버전 카탈로그
+├── local.properties             # 🔒 인증정보 (gitignore 대상)
+└── version/                     # 배포 대상 라이브러리 모듈
+    ├── build.gradle.kts
+    └── src/main/java/com/sample/android/version/
+        ├── model/               # Version            ← public API
+        ├── domain/
+        │   ├── repository/      # VersionRepository  ← public API
+        │   ├── usecase/         # GetVersionUseCase  ← public API
+        │   └── di/              # UseCase 바인딩
+        └── data/
+            ├── api/             # VersionApi (Retrofit)
+            ├── model/           # VersionResponse (DTO)
+            ├── mapper/
+            ├── repository/
+            └── di/              # internal — Retrofit 구성 (구현 디테일)
+```
+
+`settings.gradle.kts`
+
+```kotlin
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "sample-android-sdk"
+include(":version")
+```
+
+`FAIL_ON_PROJECT_REPOS`는 **저장소를 settings에서만 선언하도록 강제**하는 모드다.  
+모듈의 `build.gradle.kts`에 `repositories {}`를 쓰면 빌드가 실패한다.  
+의존성 출처를 한곳에서 관리하려는 요즘 Android 프로젝트의 기본 템플릿 설정이다.
+
+---
+
+## 3. 공개 범위(visibility) 설계
+
+배포용 라이브러리를 만들 때 Kotlin의 `internal`을 어떻게 쓸지 먼저 정해야 한다. 핵심은 이것이다.
+
+> **Kotlin의 `internal`은 "같은 컴파일 단위"를 의미한다.**
+> AAR로 배포되면 소비 프로젝트는 별개의 컴파일 단위이므로 `internal`로 선언된 것은 소비 측에서 아예 보이지 않는다.
+
+| 대상 | 가시성 | 이유 |
+|---|---|---|
+| `GetVersionUseCase`, `Version`, `VersionRepository` | `public` | 소비 앱이 직접 사용하는 공개 API |
+| `VersionApiModule` (Retrofit 구성 DI) | `internal` | 구현 디테일. 외부에 노출할 필요 없음 |
+
+Kotlin은 **수식어를 생략하면 기본이 `public`**이므로, 공개 API에 굳이 `public`을 붙일 필요는 없다.
+
+```kotlin
+// 공개 API — public 생략 (= public)
+fun interface GetVersionUseCase {
+    suspend operator fun invoke(): Version
+}
+
+// 구현 디테일 — 명시적으로 숨김
+@Module
+@InstallIn(SingletonComponent::class)
+internal object VersionApiModule {
+    @Provides
+    @Singleton
+    fun provideVersionRetrofit(okHttpClient: OkHttpClient, json: Json): Retrofit = /* ... */
+}
+```
+
+Hilt 모듈을 `internal`로 두어도 주입은 정상 동작한다.  
+Hilt는 컴파일된 AAR에 메타데이터를 함께 패키징해서 최종 앱의 컴포넌트 생성 단계에 합쳐주기 때문에  
+소비 앱이 `VersionApiModule`을 직접 참조하지 않아도 된다.
+
+---
+
+## 4. 배포 설정
+
+### 4.1 `maven-publish` 플러그인
+
+플러그인 이름이 `maven-publish`은 Maven 포맷 저장소에 배포하는 범용 Gradle 기능이다.
+배포 되는 실제 목적지는 `repositories`의 URL이 결정한다.
+
+### 4.2 `version/build.gradle.kts` 전체
+
+```kotlin
+import java.util.Properties          // ⚠️ 파일 최상단 — plugins 블록보다 위
+
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.serialization)
+    `maven-publish`
+}
+
+android {
+    namespace = "com.sample.android.version"
+    compileSdk { version = release(37) }
+
+    defaultConfig {
+        minSdk = 24
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    publishing {
+        singleVariant("release")     // release variant를 publish 컴포넌트로 노출
+    }
+}
+
+dependencies {
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+    implementation(libs.serialization.json)
+    implementation(libs.bundles.retrofit)
+}
+
+// local.properties는 Gradle이 자동으로 읽지 않으므로 직접 파싱한다
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+publishing {
+    publications {
+        register<MavenPublication>("release") {
+            groupId = "com.sample.android"
+            artifactId = "version"
+            version = "0.0.1"
+
+            afterEvaluate {
+                from(components["release"])
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = "GitHubPackages"   // 선택 — 로그/에러 메시지 식별용 라벨
+            url = uri("https://maven.pkg.github.com/my-org/sample-android-sdk")  // 필수
+            credentials {
+                username = localProperties.getProperty("github.actor")
+                password = localProperties.getProperty("github.token")
+            }
+        }
+    }
+}
+```
+
+포인트를 하나씩 보면,
+
+**`android.publishing { singleVariant("release") }`**
+AGP가 관리하는 release 빌드 변형을 publish 가능한 컴포넌트(`components["release"]`)로 노출시키는 설정이다.  
+이게 없으면 AAR을 publication에 담을 수 없다.
+
+**`afterEvaluate { from(components["release"]) }`**
+AGP가 release 컴포넌트를 등록하는 시점이 프로젝트 평가 이후이기 때문에 `afterEvaluate`로 감싸야 한다.  
+이게 없으면 "components with name 'release' not found" 류의 에러가 난다.
+
+**`name`과 `url`**
+`url`은 필수다. `name`은 선택이며이다.  
+안 넣으면 Gradle이 `maven`, `maven2` 같은 기본 이름을 붙인다.  
+기능 차이는 없지만 저장소가 여러 개일 때 로그에서 구분되므로 넣어두는 편이 좋다.
+
+### 4.3 라이브러리 모듈에 넣으면 안 되는 설정
+
+앱 모듈 템플릿을 복사해오다 보면 이걸 그대로 가져오기 쉽다.
+
+```kotlin
+// ❌ 라이브러리 모듈에는 넣지 않는다 — application 모듈 전용
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+        proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+    }
+}
+```
+
+이유는 세 가지다.
+
+1. **이중 난독화** — 라이브러리를 가져다 쓰는 앱이 자기 코드와 합쳐서 다시 R8을 돌린다. 라이브러리 단계에서 이미 난독화·축소가 되어 있으면 Retrofit 인터페이스, kotlinx.serialization 모델, Hilt 생성 코드처럼 리플렉션·어노테이션에 의존하는 것들이 깨질 위험이 크다.
+2. **소비자 디버깅 불가** — 라이브러리를 쓰는 다른 팀 입장에서 스택트레이스가 난독화된 이름으로 찍힌다. mapping 파일을 배포할 것도 아니라면 문제 추적이 불가능해진다.
+3. **`isShrinkResources`는 애초에 application 전용** — 최종 앱이 어떤 리소스를 실제로 사용하는지 알아야 안전하게 지울 수 있는데, 라이브러리는 그걸 알 수 없다.
+
+라이브러리에서 대신 써야 하는 건 **`consumerProguardFiles`** 다. 라이브러리 자신을 난독화하는 게 아니라, "이 라이브러리를 쓰는 앱이 R8을 돌릴 때 지켜야 할 keep 규칙"을 AAR에 함께 실어 보내는 방식이다.
+
+```kotlin
+defaultConfig {
+    minSdk = 24
+    consumerProguardFiles("consumer-rules.pro")
+}
+```
+
+---
+
+## 5. 인증정보를 어디에 둘 것인가
+
+GitHub Packages는 public/private 무관하게 **모든 접근에 인증을 요구**한다.
+따라서 local.properties에 토큰들을 보관한다.
+
+### 5.1 PAT 발급
+
+Settings → Developer settings → Personal access tokens (classic)에서 발급한다.
+
+| 용도 | 필요 스코프 |
+|---|---|
+| 배포 (업로드) | `write:packages` (`read:packages` 자동 포함) + `repo` |
+| 소비 (다운로드) | `read:packages` + `repo` |
+
+`repo` 스코프가 필요한 이유는 저장소가 private이기 때문이다.  
+저장소를 읽을 권한이 없으면 그 저장소에 속한 패키지에도 접근할 수 없다.  
+참고로 `github.actor`에 들어가는 값은 발급받는 게 아니라 **본인의 GitHub 사용자명**이다.
+
+### 5.2 `local.properties`는 Gradle 연동
+
+```kotlin
+// ❌ local.properties에 github.actor를 넣어도 null이 나온다
+username = project.findProperty("github.actor") as? String
+```
+
+`project.findProperty()`가 자동으로 읽는 것은 **`gradle.properties`뿐**이다(프로젝트 루트 + `~/.gradle/`). `local.properties`는 Android Gradle Plugin이 `sdk.dir`, `ndk.dir` 같은 값을 읽기 위해 **내부적으로만** 파싱하는 파일이라, Gradle의 일반 프로퍼티 시스템과는 완전히 별개다.
+
+그래서 직접 파싱해야 한다.
+
+```properties
+# local.properties
+github.actor=<github-username>
+github.token=<PAT>
+```
+
+```kotlin
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+// 사용
+username = localProperties.getProperty("github.actor")
+password = localProperties.getProperty("github.token")
+```
+
+---
+
+## 6. 배포 실행과 확인
+
+```bash
+# 로컬 검증 — ~/.m2 에만 설치, GitHub에 올라가지 않음
+./gradlew :version:publishToMavenLocal
+
+# 실제 배포
+./gradlew :version:publish
+```
+
+확인은 세 단계로 한다.
+
+**1) 터미널 출력**
+`BUILD SUCCESSFUL`과 함께 `:version:publishReleasePublicationToGitHubPackagesRepository` 태스크가 실행되어야 한다.
+
+| 에러 | 의미 |
+|---|---|
+| `401` / `403` | 인증 실패 — 사용자명, 토큰, 스코프 확인 |
+| `409 Conflict` | 같은 버전이 이미 존재. GitHub Packages는 덮어쓰기를 허용하지 않는다 |
+
+**2) GitHub 웹**
+`https://github.com/my-org/sample-android-sdk/packages`에서 패키지와 버전을 확인한다.
+
+**3) Packages 페이지의 함정**
+배포가 성공하면 이런 스니펫이 보인다.
+
+```xml
+<dependency>
+  <groupId>com.sample.android</groupId>
+  <artifactId>version</artifactId>
+  <version>0.0.1</version>
+</dependency>
+```
+
+```
+$ mvn install
+```
+
+처음 보면 "Gradle 프로젝트인데 왜 Maven이 나오지?" 싶지만 정상이다. GitHub Packages는 Maven 포맷 레지스트리라서, 빌드 도구와 무관하게 **항상 이 Maven XML 스니펫만** 보여준다. Gradle 형식으로 바꿔서 표시하는 옵션은 없다.
+
+이 XML이 알려주는 유용한 정보는 **좌표(coordinates)가 의도대로 배포되었다는 사실**이다. Gradle에서는 콜론으로 이어 붙여 쓴다.
+
+```kotlin
+implementation("com.sample.android:version:0.0.1")
+```
+
+Gradle 사용법은 README나 Release note에 직접 적어두는 편이 실용적이다.
+
+---
+
+## 7. 소비 측 설정
+
+### 7.1 저장소 등록 — `settings.gradle.kts`
+
+여기서 앞의 `FAIL_ON_PROJECT_REPOS`가 발목을 잡는다. **앱 모듈의 `build.gradle.kts`가 아니라 `settings.gradle.kts`에** 저장소를 등록해야 한다.
+
+```kotlin
+import java.util.Properties
+
+// settings.gradle.kts에는 rootProject가 아직 없으므로 settingsDir 기준으로 읽는다
+val localProperties = Properties().apply {
+    val file = File(settingsDir, "local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/my-org/sample-android-sdk")
+            credentials {
+                username = localProperties.getProperty("github.actor")
+                password = localProperties.getProperty("github.token")
+            }
+        }
+    }
+}
+```
+
+두 가지 주의점이 있다.
+
+- `settings.gradle.kts`는 `build.gradle.kts`보다 먼저 평가되므로 `rootProject.file(...)`을 쓸 수 없다. **`settingsDir`** 또는 `rootDir`를 써야 한다.
+- 토큰을 문자열로 직접 하드코딩하면 안 된다. `settings.gradle.kts`는 git 추적 파일이므로 커밋 시 토큰이 유출된다.
+
+### 7.2 소비 측 `local.properties`
+
+배포 측 프로젝트와는 **완전히 별개 파일**이다. 같은 머신이라도 공유되지 않으므로 여기에도 따로 넣어야 한다.
+
+```properties
+github.actor=<github-username>
+github.token=<PAT — read:packages + repo>
+```
+
+### 7.3 버전 카탈로그 & 의존성
+
+```toml
+# gradle/libs.versions.toml
+[versions]
+sampleSdk = "0.0.1"
+
+[libraries]
+sample-version = { group = "com.sample.android", name = "version", version.ref = "sampleSdk" }
+```
+
+```kotlin
+// app/build.gradle.kts
+dependencies {
+    implementation(libs.sample.version)   // alias의 '-'는 접근자에서 '.'로 변환된다
+}
+```
+
+### 7.4 전제 조건 — 호스트 앱이 제공해야 하는 바인딩
+
+이 라이브러리는 자체적으로 `OkHttpClient`를 만들지 않고, **호스트 앱이 제공하는 바인딩을 주입받아** 자기 전용 Retrofit을 구성하도록 설계했다. 앱마다 인터셉터·타임아웃 정책이 다르기 때문이다.
+
+```kotlin
+// 라이브러리 내부 (internal)
+@Provides
+@Singleton
+fun provideVersionRetrofit(okHttpClient: OkHttpClient, json: Json): Retrofit =
+    Retrofit.Builder()
+        .baseUrl(BASE_URL)
+        .client(okHttpClient)
+        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+        .build()
+```
+
+따라서 소비 앱에 이 두 개의 바인딩이 있어야 한다.
+
+```kotlin
+// 소비 앱
+@Module
+@InstallIn(SingletonComponent::class)
+object NetworkModule {
+    @Provides
+    @Singleton
+    fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder().build()
+
+    @Provides
+    @Singleton
+    fun provideJson(): Json = Json { ignoreUnknownKeys = true }
+}
+```
+
+라이브러리를 만들 때 이런 부분을 명시적으로 문서화해두지 않으면, 소비 측에서 `MissingBinding` 에러를 보고 원인을 찾느라 시간을 쓰게 된다.
+
+### 7.5 실제 사용
+
+```kotlin
+import com.sample.android.version.domain.usecase.GetVersionUseCase
+
+@HiltViewModel
+class HomeViewModel @Inject constructor(
+    private val getVersionUseCase: GetVersionUseCase   // 라이브러리가 바인딩까지 제공
+) : ViewModel() {
+
+    init {
+        checkVersion()
+    }
+
+    private fun checkVersion() {
+        viewModelScope.launch {
+            val version = getVersionUseCase()          // fun interface → invoke 호출
+
+            when {
+                version.isForceUpdate(BuildConfig.VERSION_CODE) -> showForceUpdateDialog()
+                version.isOptionalUpdate(BuildConfig.VERSION_CODE) -> showOptionalUpdateDialog()
+                else -> Unit
+            }
+        }
+    }
+}
+```
+
+소비 측에서는 `@Inject`로 주입받아 쓰기만 하면 된다. Retrofit 인스턴스 생성, DTO 매핑, Repository 구현은 모두 라이브러리 내부에 `internal`로 숨어 있다.
+
+---
+
+## 8. 버전 올려 재배포하기
+
+GitHub Packages는 **같은 버전 덮어쓰기를 허용하지 않는다.** 수정했으면 반드시 버전을 올려야 한다.
+
+1. 배포 측: `version/build.gradle.kts`의 `version = "0.0.2"` 수정
+2. 배포 측: `./gradlew :version:publish`
+3. GitHub: Release 생성 — tag `v0.0.2`, title `v0.0.2`, note에 변경사항 + Gradle 설치 스니펫
+4. 소비 측: `libs.versions.toml`의 버전 수정 → Gradle sync
+
+### 버전 값을 어디에 둘까
+
+세 가지 방법이 있고, 각각 트레이드오프가 있다.
+
+```kotlin
+// 1) 하드코딩 — 가장 단순. 파일 하나만 보면 현재 버전 파악 가능
+version = "0.0.1"
+
+// 2) 프로퍼티 주입 — CI에서 태그 기준으로 주입하기 좋음
+version = project.findProperty("VERSION_NAME") as? String ?: "0.0.1"
+
+// 3) ❌ defaultConfig.versionName — 라이브러리 모듈에서는 불가능
+```
+
+3번은 아예 컴파일이 안 된다. AGP의 Kotlin DSL은 모듈 타입에 따라 `defaultConfig` 타입이 다른데, `versionCode`/`versionName`은 **`ApplicationDefaultConfig`에만** 있다. 라이브러리 모듈의 `LibraryDefaultConfig`에는 이 프로퍼티가 존재하지 않아서 `Unresolved reference 'versionName'`이 난다. APK 버전 정보는 애초에 애플리케이션 개념이기 때문이다.
+
+2번을 쓸 때는 **프로퍼티를 선언하지 않으면 조용히 fallback 값으로 배포된다**는 점을 주의해야 한다. `gradle.properties`에 `VERSION_NAME`을 넣는 걸 깜빡하면 계속 같은 버전으로 배포를 시도하다가 `409 Conflict`를 만난다.
+
+### CI 자동화
+
+매번 로컬에서 `./gradlew publish`를 치는 게 번거로우면 GitHub Actions로 넘길 수 있다. 이때 좋은 점은 **PAT를 만들 필요조차 없다**는 것이다. 같은 저장소에 배포하는 경우라면 Actions가 워크플로우마다 자동 발급하는 `secrets.GITHUB_TOKEN`에 권한만 주면 된다.
+
+```yaml
+# .github/workflows/publish.yml
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # ← 이 권한만 주면 GITHUB_TOKEN으로 배포 가능
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: ./gradlew :version:publish
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+단, 이 경우 build script가 환경변수도 읽을 수 있어야 한다. 로컬과 CI 양쪽을 지원하려면 이렇게 쓴다.
+
+```kotlin
+credentials {
+    username = System.getenv("GITHUB_ACTOR") ?: localProperties.getProperty("github.actor")
+    password = System.getenv("GITHUB_TOKEN") ?: localProperties.getProperty("github.token")
+}
+```
+
+---
+
+## 9. 삽질 기록
+
+### 9.1 `Unresolved reference 'util'`
+
+`local.properties`를 읽으려고 흔히 쓰는 이 코드가 컴파일되지 않았다.
+
+```kotlin
+val localProperties = java.util.Properties().apply { /* ... */ }
+```
+
+```
+e: build.gradle.kts:41:28: Unresolved reference 'util'.
+e: build.gradle.kts:44:34: Unresolved reference 'load'.
+```
+
+에러 위치가 `java`가 아니라 **`util`** 이라는 점이 단서다. `java`라는 이름 자체는 해석에 성공했고, 그 대상에 `util`이라는 멤버가 없다는 뜻이다. 즉 **`java`가 패키지가 아닌 다른 것(적용된 플러그인들이 생성하는 Kotlin DSL 접근자)으로 먼저 해석되면서** 이름이 충돌한 것이다.
+
+수많은 Android 튜토리얼에 그대로 등장하는 코드인데도, 플러그인 조합에 따라 이렇게 깨질 수 있다. 해결은 **명시적 import로 짧은 이름만 쓰는 것**이다.
+
+```kotlin
+import java.util.Properties   // 파일 최상단
+
+val localProperties = Properties().apply { /* ... */ }
+```
+
+참고로 "build.gradle.kts에서는 import를 못 쓴다"고 오해하기 쉬운데, 쓸 수 있다. 다만 Kotlin 문법상 **`import`는 파일 맨 처음(`plugins` 블록보다 위)에 와야 한다.** `plugins {}` 뒤에 넣으면 `Imports are only allowed in the beginning of file` 에러가 난다.
+
+`java.*`를 아예 피하고 싶다면 Kotlin 표준 라이브러리만으로 파싱할 수도 있다.
+
+```kotlin
+val localProperties: Map<String, String> = rootProject.file("local.properties")
+    .takeIf { it.exists() }
+    ?.readLines()
+    ?.filter { it.isNotBlank() && !it.trimStart().startsWith("#") }
+    ?.mapNotNull { line ->
+        val idx = line.indexOf('=')
+        if (idx == -1) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+    }
+    ?.toMap()
+    .orEmpty()
+```
+
+### 9.2 소비 측 External Libraries에 라이브러리가 안 보임
+
+버전 카탈로그에 등록하고 `implementation(libs.sample.version)`까지 추가했는데, Android Studio의 External Libraries 트리에 아예 나타나지 않았다.
+
+원인은 단순했다. **GitHub Packages 저장소를 등록하지 않았다.** 의존성 좌표만 선언했을 뿐, Gradle에게 "이걸 어디서 받아오라"고 알려주지 않은 것이다.
+
+여기서 `FAIL_ON_PROJECT_REPOS`가 한 번 더 발목을 잡는다. 습관적으로 앱 모듈 `build.gradle.kts`에 `repositories { maven { ... } }`를 추가하면 빌드가 실패한다. **반드시 `settings.gradle.kts`의 `dependencyResolutionManagement`에 넣어야 한다.**
+
+### 9.3 정리 — 자주 만나는 에러
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| `Unresolved reference 'util'` | 플러그인 접근자와 `java` 이름 충돌 | 최상단 `import java.util.Properties` |
+| `Imports are only allowed in the beginning of file` | `import`를 `plugins {}` 뒤에 배치 | 파일 1번째 줄로 이동 |
+| `Unresolved reference 'versionName'` | 라이브러리 모듈에는 해당 프로퍼티가 없음 | `publishing` 블록에서 버전 지정 |
+| `components with name 'release' not found` | AGP 컴포넌트 등록 시점 문제 | `afterEvaluate { from(components["release"]) }` |
+| 소비 측에 라이브러리가 안 보임 | 저장소 미등록 | `settings.gradle.kts`에 maven repo 추가 |
+| 모듈에 `repositories {}` 추가 후 빌드 실패 | `FAIL_ON_PROJECT_REPOS` 모드 | settings에만 선언 |
+| sync 시 `401` / `403` | credentials 없음 또는 스코프 부족 | private repo는 `repo` 스코프 필수 |
+| publish 시 `409 Conflict` | 같은 버전이 이미 배포됨 | 버전 올리기 |
+| `local.properties` 값이 인식 안 됨 | `findProperty()`는 `gradle.properties`만 읽음 | `Properties()`로 직접 파싱 |
+| `MissingBinding: OkHttpClient` | 호스트 앱에 필요 바인딩 없음 | 소비 앱에 `@Provides` 추가 |
+
+---
+
+### 10.1 추후 개선사항
+
+1. 라이브러리 자체에서 난독화 하도록 개선
+2. 호스트 앱에서 OkHttpClient, Json 제공 안해도 되도록 수정
+3. 버전 불러올시 파라미터에 dto, entity도 받을수 있도록 수정
+
+## 마무리
+
+정리하면 핵심은 네 가지다.
+
+1. **GitHub Packages는 저장소일 뿐이다.** 배포는 `publish` 태스크를 실행해야 일어나고, 접근 제어는 저장소 visibility가 결정한다.
+2. **토큰은 커밋되는 파일에 두지 않는다.** `local.properties`가 프로젝트 스코프와 git 안전성을 동시에 만족하지만, Gradle이 자동으로 읽어주지 않으므로 직접 파싱해야 한다.
+3. **라이브러리 모듈은 앱 모듈과 다르다.** 난독화·리소스 축소는 앱에 맡기고, 라이브러리는 `consumerProguardFiles`로 keep 규칙만 전달한다. `versionName`처럼 애초에 존재하지 않는 DSL도 있다.
+4. **공개 API 경계를 `internal`로 설계한다.** AAR 소비자는 별개 컴파일 단위이므로, `internal`은 그대로 구현 은닉 수단이 된다.
+
+한 번 파이프라인을 깔아두면 그다음부터는 버전 올리고 `publish` 한 줄이다. 사내에 여러 앱이 있고 공통 코드가 계속 늘어나는 상황이라면, 초기 설정 비용을 들일 만한 가치가 충분하다.
+
